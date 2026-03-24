@@ -699,6 +699,34 @@ async def debug_xhs():
             info["test_api_ok"] = False
             info["test_api_error"] = str(e)[:200]
 
+    # 直接 HTTP 测试
+    import httpx as _httpx
+    try:
+        r = _httpx.get("https://www.xiaohongshu.com/explore/695ba7ae000000000a028c2c",
+                       headers=BROWSER_HEADERS, follow_redirects=True, timeout=15)
+        info["direct_http_status"] = r.status_code
+        info["direct_http_has_initial_state"] = "__INITIAL_STATE__" in r.text
+        # 检查 INITIAL_STATE 是否有真实内容
+        import re as _re
+        m = _re.search(r'window\.__INITIAL_STATE__\s*=\s*(\{.+?\})\s*</script>', r.text, _re.DOTALL)
+        if m:
+            raw = m.group(1).replace("undefined", "null")
+            d = json.loads(raw)
+            nd = d.get("note", {}).get("noteDetailMap", {})
+            if nd:
+                fk = next(iter(nd))
+                nt = nd[fk].get("note", {})
+                info["html_title"] = nt.get("title", "")[:50]
+                info["html_author"] = nt.get("user", {}).get("nickname", "")[:30]
+                info["html_has_content"] = bool(nt.get("title") or nt.get("desc"))
+            else:
+                info["html_has_content"] = False
+                info["html_note_map_empty"] = True
+        else:
+            info["html_initial_state_missing"] = True
+    except Exception as e:
+        info["direct_http_error"] = str(e)[:200]
+
     return JSONResponse(content=info)
 
 
