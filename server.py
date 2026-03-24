@@ -685,11 +685,19 @@ async def debug_xhs():
     if xhs:
         try:
             detail = xhs.get_note_detail("695ba7ae000000000a028c2c")
-            info["test_note_title"] = (detail or {}).get("title", "N/A")[:50]
-            info["test_api_ok"] = bool(detail and detail.get("title"))
+            if detail:
+                info["test_note_keys"] = list(detail.keys())[:15]
+                info["test_note_title"] = (detail.get("title") or detail.get("displayTitle") or "")[:50]
+                info["test_note_type"] = detail.get("type", "?")
+                info["test_note_has_user"] = bool(detail.get("user"))
+                info["test_note_has_desc"] = bool(detail.get("desc"))
+                info["test_api_ok"] = bool(detail.get("title") or detail.get("desc") or detail.get("user"))
+            else:
+                info["test_api_ok"] = False
+                info["test_detail_raw"] = "None"
         except Exception as e:
             info["test_api_ok"] = False
-            info["test_api_error"] = str(e)
+            info["test_api_error"] = str(e)[:200]
 
     return JSONResponse(content=info)
 
