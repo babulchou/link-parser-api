@@ -8,6 +8,7 @@
 """
 
 import json
+import logging
 import re
 import os
 from urllib.parse import quote, urlparse, parse_qs
@@ -17,6 +18,32 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+
+logger = logging.getLogger(__name__)
+
+# ── 小红书 API 客户端（通过 xiaohongshu-cli）────────────────────
+_xhs_client = None
+
+def _get_xhs_client():
+    """获取或初始化 XhsClient 单例。从环境变量 XHS_COOKIES 读取 Cookie JSON。"""
+    global _xhs_client
+    if _xhs_client is not None:
+        return _xhs_client
+
+    cookies_json = os.environ.get("XHS_COOKIES", "")
+    if not cookies_json:
+        logger.warning("XHS_COOKIES 环境变量未设置，小红书 API 解析不可用")
+        return None
+
+    try:
+        from xhs_cli.client import XhsClient
+        cookies = json.loads(cookies_json)
+        _xhs_client = XhsClient(cookies=cookies, request_delay=0.5, max_retries=2)
+        logger.info("XhsClient 初始化成功")
+        return _xhs_client
+    except Exception as e:
+        logger.error("XhsClient 初始化失败: %s", e)
+        return None
 
 app = FastAPI(title="Link Parser API", version="1.0.0")
 
@@ -76,7 +103,7 @@ def identify_platform(url: str) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  小红书解析（复用 xiaohongshu-mcp 的逻辑）
+#  小红书解析（优先使用 xhs_cli API，降级到 HTML 解析）
 # ═══════════════════════════════════════════════════════════════════
 
 def _extract_xhs_note_id(url: str) -> str | None:
@@ -94,26 +121,112 @@ def _extract_xhs_note_id(url: str) -> str | None:
     return None
 
 
+def _format_xhs_count(count) -> str:
+    """格式化小红书互动数"""
+    if isinstance(count, str):
+        return count
+    if isinstance(count, (int, float)):
+        if count >= 10000:
+            return f"{count/10000:.1f}万"
+        return str(int(count))
+    return str(count) if count else "0"
+
+
+async def _resolve_xhs_short_link(url: str, client: httpx.AsyncClient) -> str | None:
+    """解析小红书短链接，返回最终笔记 ID"""
+    try:
+        resp = await client.get(url, follow_redirects=True)
+        final_url = str(resp.url)
+        return _extract_xhs_note_id(final_url)
+    except Exception:
+        return None
+
+
 async def parse_xiaohongshu(url: str, client: httpx.AsyncClient) -> dict:
-    """解析小红书笔记内容"""
-    # 先尝试从直接链接获取
+    """解析小红书笔记内容 — 优先 xhs_cli API，降级 HTML"""
     note_id = _extract_xhs_note_id(url)
 
-    # 如果是短链接，先跟随重定向
+    # 如果是短链接，先跟随重定向拿到笔记 ID
     if "xhslink.com" in url or not note_id:
-        try:
-            resp = await client.get(url, follow_redirects=True)
-            final_url = str(resp.url)
-            note_id = _extract_xhs_note_id(final_url)
-            if not note_id:
-                # 尝试从重定向后的页面解析
-                return _parse_generic_html(resp.text, final_url)
-        except Exception:
-            pass
+        note_id = await _resolve_xhs_short_link(url, client)
 
     if not note_id:
         return {"error": "无法从链接提取笔记ID"}
 
+    # ── 方案 A: 使用 xhs_cli API（需要有效 Cookie）──
+    xhs = _get_xhs_client()
+    if xhs:
+        try:
+            detail = xhs.get_note_detail(note_id)
+            if detail:
+                # get_note_detail 可能返回两种格式
+                # 1) 来自 get_note_from_html: {title, desc, user, ...}
+                # 2) 来自 get_note_by_id (feed API): {noteId, type, desc, title, user, imageList, ...}
+                title = detail.get("title", "") or detail.get("displayTitle", "")
+                desc = detail.get("desc", "")
+                user = detail.get("user", {})
+                author = user.get("nickname", "") or user.get("nick_name", "")
+
+                # 互动数据 — 兼容两种 key 命名
+                interact = detail.get("interactInfo", detail.get("interact_info", {}))
+                likes = interact.get("likedCount", interact.get("liked_count", "0"))
+                comments = interact.get("commentCount", interact.get("comment_count", "0"))
+                collects = interact.get("collectedCount", interact.get("collected_count", "0"))
+                shares = interact.get("shareCount", interact.get("share_count", "0"))
+
+                # 图片
+                image_list = detail.get("imageList", detail.get("image_list", []))
+
+                # 标签
+                tags = []
+                for tag in detail.get("tagList", detail.get("tag_list", [])):
+                    tag_name = tag.get("name", "") if isinstance(tag, dict) else str(tag)
+                    if tag_name:
+                        tags.append(tag_name)
+
+                # 类型
+                note_type_raw = detail.get("type", "normal")
+                note_type = "视频" if note_type_raw == "video" else "图文"
+
+                # 有实际内容？
+                if title or desc or author:
+                    summary_text = desc if desc else title
+                    if len(summary_text) > 300:
+                        summary_text = summary_text[:300] + "..."
+
+                    result = {
+                        "title": title or "小红书笔记",
+                        "summary": summary_text,
+                        "author": author or "未知",
+                        "likes": _format_xhs_count(likes),
+                        "comments": _format_xhs_count(comments),
+                        "collects": _format_xhs_count(collects),
+                        "tags": tags,
+                        "content_type": note_type,
+                        "extra_info": f"👤 {author or '未知'} · ❤️ {_format_xhs_count(likes)} · 💬 {_format_xhs_count(comments)} · ⭐ {_format_xhs_count(collects)}",
+                    }
+                    # 附加首张图片 URL
+                    if image_list:
+                        first_img = image_list[0]
+                        img_url = ""
+                        # 格式 1: {urlPre: "..."} 或 {url_pre: "..."}
+                        img_url = first_img.get("urlPre", first_img.get("url_pre", ""))
+                        # 格式 2: {info_list: [{url: "..."}]} 或 {infoList: [{url: "..."}]}
+                        if not img_url:
+                            info_list = first_img.get("infoList", first_img.get("info_list", []))
+                            if info_list:
+                                img_url = info_list[0].get("url", "")
+                        if not img_url:
+                            img_url = first_img.get("url", "")
+                        if img_url:
+                            result["cover_image"] = img_url
+                    return result
+
+        except Exception as e:
+            logger.warning("xhs_cli API 解析失败 (note_id=%s): %s", note_id, e)
+            # 降级到方案 B
+
+    # ── 方案 B: 降级到 HTML 解析（可能被反爬拿到空壳数据）──
     note_url = f"https://www.xiaohongshu.com/explore/{note_id}"
     xhs_headers = {
         **BROWSER_HEADERS,
@@ -127,7 +240,6 @@ async def parse_xiaohongshu(url: str, client: httpx.AsyncClient) -> dict:
         html = resp.text
 
         # 从 __INITIAL_STATE__ 提取结构化数据
-        # 使用贪婪匹配 + 回溯来确保匹配完整的 JSON 对象
         pattern = r'window\.__INITIAL_STATE__\s*=\s*({.+})\s*</script>'
         match = re.search(pattern, html, re.DOTALL)
 
@@ -144,19 +256,15 @@ async def parse_xiaohongshu(url: str, client: httpx.AsyncClient) -> dict:
                     title = detail.get("title", "")
                     desc = detail.get("desc", "")
                     author = detail.get("user", {}).get("nickname", "")
-                    likes = detail.get("interactInfo", {}).get("likedCount", 0)
-                    comments = detail.get("interactInfo", {}).get("commentCount", 0)
-                    collects = detail.get("interactInfo", {}).get("collectedCount", 0)
-                    tags = [tag.get("name", "") for tag in detail.get("tagList", [])]
-                    note_type = "视频" if detail.get("type") == "video" else "图文"
 
-                    # 检查是否有实质内容 — 如果标题、描述、作者全为空，视为反爬空壳
                     has_real_content = bool(title) or bool(desc) or bool(author)
-                    if not has_real_content:
-                        # 降级到 meta 标签解析
-                        pass
-                    else:
-                        # 生成摘要
+                    if has_real_content:
+                        likes = detail.get("interactInfo", {}).get("likedCount", 0)
+                        comments = detail.get("interactInfo", {}).get("commentCount", 0)
+                        collects = detail.get("interactInfo", {}).get("collectedCount", 0)
+                        tags = [tag.get("name", "") for tag in detail.get("tagList", [])]
+                        note_type = "视频" if detail.get("type") == "video" else "图文"
+
                         summary_text = desc if desc else title
                         if len(summary_text) > 300:
                             summary_text = summary_text[:300] + "..."
@@ -171,13 +279,13 @@ async def parse_xiaohongshu(url: str, client: httpx.AsyncClient) -> dict:
                             "tags": tags,
                             "content_type": note_type,
                             "extra_info": f"👤 {author or '未知'} · ❤️ {likes} · 💬 {comments} · ⭐ {collects}",
+                            "_fallback": True,
                         }
             except (json.JSONDecodeError, StopIteration, KeyError):
                 pass
 
-        # 降级：从 meta 标签解析
+        # 最终降级：从 meta 标签解析
         result = _parse_generic_html(html, note_url)
-        # 标记为降级结果，帮助前端判断
         result["_fallback"] = True
         return result
 

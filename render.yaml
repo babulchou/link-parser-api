@@ -8,3 +8,5 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: "3.12"
+      - key: XHS_COOKIES
+        sync: false  # 在 Render Dashboard 手动设置（包含敏感 Cookie 信息）
