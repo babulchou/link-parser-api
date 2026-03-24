@@ -393,7 +393,8 @@ async def parse_xiaohongshu(url: str, client: httpx.AsyncClient) -> dict:
         return result
 
     except Exception as e:
-        return {"error": f"请求小红书失败: {str(e)}"}
+        logger.error("方案C(HTML解析)异常: note_id=%s, error=%s", note_id, e)
+        return {"error": f"请求小红书失败: {str(e)}", "note_id": note_id}
 
 
 # ═══════════════════════════════════════════════════════════════════
