@@ -242,12 +242,15 @@ async def _resolve_xhs_short_link(url: str, client: httpx.AsyncClient) -> str | 
 async def parse_xiaohongshu(url: str, client: httpx.AsyncClient) -> dict:
     """解析小红书笔记内容 — 三层降级：xhs CLI → xhs_cli API → HTML 解析"""
     note_id = _extract_xhs_note_id(url)
+    logger.info("小红书解析开始: url=%s, 初始note_id=%s", url, note_id)
 
     # 如果是短链接，先跟随重定向拿到笔记 ID
     if "xhslink.com" in url or not note_id:
         note_id = await _resolve_xhs_short_link(url, client)
+        logger.info("短链接重定向后 note_id=%s", note_id)
 
     if not note_id:
+        logger.warning("无法提取笔记ID: url=%s", url)
         return {"error": "无法从链接提取笔记ID"}
 
     # ── 方案 A: 使用 xhs CLI subprocess（本地有浏览器 Cookie 时可用）──
@@ -259,14 +262,19 @@ async def parse_xiaohongshu(url: str, client: httpx.AsyncClient) -> dict:
             if note_card:
                 result = _format_xhs_result_from_note_card(note_card)
                 if result:
-                    logger.info("xhs CLI 解析成功 (note_id=%s)", note_id)
+                    logger.info("方案A(xhs CLI)成功: note_id=%s", note_id)
                     return result
+        logger.info("方案A(xhs CLI): 数据为空, items=%d", len(cli_data.get("items", [])))
+    else:
+        xhs_path = shutil.which("xhs")
+        logger.info("方案A(xhs CLI)跳过: xhs_path=%s, cli_data=%s", xhs_path, cli_data)
 
     # ── 方案 B: 使用 xhs_cli Python API（Render 等环境用 Cookie 环境变量）──
     xhs = _get_xhs_client()
     if xhs:
         try:
             detail = xhs.get_note_detail(note_id)
+            logger.info("方案B(xhs_cli API): detail=%s", "有数据" if detail else "空")
             if detail:
                 title = detail.get("title", "") or detail.get("displayTitle", "")
                 desc = detail.get("desc", "")
@@ -312,9 +320,12 @@ async def parse_xiaohongshu(url: str, client: httpx.AsyncClient) -> dict:
                     return result
 
         except Exception as e:
-            logger.warning("xhs_cli API 解析失败 (note_id=%s): %s", note_id, e)
+            logger.warning("方案B(xhs_cli API)失败: note_id=%s, error=%s", note_id, e)
+    else:
+        logger.info("方案B(xhs_cli API)跳过: XhsClient未初始化")
 
     # ── 方案 C: 降级到 HTML 解析（可能被反爬拿到空壳数据）──
+    logger.info("方案C(HTML解析)开始: note_id=%s", note_id)
     note_url = f"https://www.xiaohongshu.com/explore/{note_id}"
     xhs_headers = {
         **BROWSER_HEADERS,
@@ -371,6 +382,13 @@ async def parse_xiaohongshu(url: str, client: httpx.AsyncClient) -> dict:
                 pass
 
         result = _parse_generic_html(html, note_url)
+        # 检测错误页面（如 "你访问的页面不见了"）
+        error_patterns = ["页面不见了", "页面不存在", "访问受限", "请在app内打开"]
+        title_str = result.get("title", "")
+        summary_str = result.get("summary", "")
+        if any(p in title_str for p in error_patterns) or "沪ICP备" in summary_str:
+            logger.warning("方案C(HTML解析): 检测到错误页面, title=%s", title_str)
+            return {"error": f"小红书返回错误页面: {title_str}", "note_id": note_id}
         result["_fallback"] = True
         return result
 
@@ -727,6 +745,15 @@ async def root():
     return {"service": "Link Parser API", "version": "1.0.0", "status": "ok"}
 
 
+def _clean_url(url: str) -> str:
+    """清洗 URL：去除末尾中文标点、全角字符等非法字符"""
+    # 去除末尾的中文/全角标点
+    url = re.sub(r'[\uff00-\uffef\u3000-\u303f\u4e00-\u9fff，。！？、；：""''【】（）]+$', '', url)
+    # 去除末尾的英文标点残留
+    url = re.sub(r'[,;:!?)}\]]+$', '', url)
+    return url.strip()
+
+
 @app.get("/parse")
 async def parse_link(url: str = Query(..., description="要解析的链接")):
     """
@@ -736,6 +763,10 @@ async def parse_link(url: str = Query(..., description="要解析的链接")):
     if not url:
         return JSONResponse(status_code=400, content={"error": "缺少 url 参数"})
 
+    # 清洗 URL（去除中文标点等脏字符）
+    url = _clean_url(url)
+    logger.info("解析链接: %s", url)
+
     # 自动补全 https
     if not url.startswith("http"):
         url = "https://" + url
@@ -744,6 +775,7 @@ async def parse_link(url: str = Query(..., description="要解析的链接")):
         result = await _parse_url(url)
         return JSONResponse(content=result)
     except Exception as e:
+        logger.error("解析失败: %s — %s", url, e)
         return JSONResponse(
             status_code=500,
             content={"error": f"解析失败: {str(e)}", "url": url},
