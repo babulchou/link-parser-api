@@ -665,6 +665,35 @@ async def parse_link(url: str = Query(..., description="要解析的链接")):
         )
 
 
+@app.get("/debug/xhs")
+async def debug_xhs():
+    """诊断 xhs_cli 状态（调试用）"""
+    info = {
+        "xhs_cookies_set": bool(os.environ.get("XHS_COOKIES", "")),
+        "xhs_cookies_len": len(os.environ.get("XHS_COOKIES", "")),
+    }
+    try:
+        from xhs_cli.client import XhsClient
+        info["xhs_cli_import"] = True
+    except Exception as e:
+        info["xhs_cli_import"] = False
+        info["xhs_cli_import_error"] = str(e)
+
+    xhs = _get_xhs_client()
+    info["xhs_client_ok"] = xhs is not None
+
+    if xhs:
+        try:
+            detail = xhs.get_note_detail("695ba7ae000000000a028c2c")
+            info["test_note_title"] = (detail or {}).get("title", "N/A")[:50]
+            info["test_api_ok"] = bool(detail and detail.get("title"))
+        except Exception as e:
+            info["test_api_ok"] = False
+            info["test_api_error"] = str(e)
+
+    return JSONResponse(content=info)
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
