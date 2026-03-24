@@ -127,7 +127,8 @@ async def parse_xiaohongshu(url: str, client: httpx.AsyncClient) -> dict:
         html = resp.text
 
         # 从 __INITIAL_STATE__ 提取结构化数据
-        pattern = r'window\.__INITIAL_STATE__\s*=\s*({.*?})\s*</script>'
+        # 使用贪婪匹配 + 回溯来确保匹配完整的 JSON 对象
+        pattern = r'window\.__INITIAL_STATE__\s*=\s*({.+})\s*</script>'
         match = re.search(pattern, html, re.DOTALL)
 
         if match:
@@ -142,34 +143,43 @@ async def parse_xiaohongshu(url: str, client: httpx.AsyncClient) -> dict:
 
                     title = detail.get("title", "")
                     desc = detail.get("desc", "")
-                    author = detail.get("user", {}).get("nickname", "未知")
+                    author = detail.get("user", {}).get("nickname", "")
                     likes = detail.get("interactInfo", {}).get("likedCount", 0)
                     comments = detail.get("interactInfo", {}).get("commentCount", 0)
                     collects = detail.get("interactInfo", {}).get("collectedCount", 0)
                     tags = [tag.get("name", "") for tag in detail.get("tagList", [])]
                     note_type = "视频" if detail.get("type") == "video" else "图文"
 
-                    # 生成摘要
-                    summary_text = desc if desc else title
-                    if len(summary_text) > 300:
-                        summary_text = summary_text[:300] + "..."
+                    # 检查是否有实质内容 — 如果标题、描述、作者全为空，视为反爬空壳
+                    has_real_content = bool(title) or bool(desc) or bool(author)
+                    if not has_real_content:
+                        # 降级到 meta 标签解析
+                        pass
+                    else:
+                        # 生成摘要
+                        summary_text = desc if desc else title
+                        if len(summary_text) > 300:
+                            summary_text = summary_text[:300] + "..."
 
-                    return {
-                        "title": title or "小红书笔记",
-                        "summary": summary_text,
-                        "author": author,
-                        "likes": likes,
-                        "comments": comments,
-                        "collects": collects,
-                        "tags": tags,
-                        "content_type": note_type,
-                        "extra_info": f"👤 {author} · ❤️ {likes} · 💬 {comments} · ⭐ {collects}",
-                    }
+                        return {
+                            "title": title or "小红书笔记",
+                            "summary": summary_text,
+                            "author": author or "未知",
+                            "likes": likes,
+                            "comments": comments,
+                            "collects": collects,
+                            "tags": tags,
+                            "content_type": note_type,
+                            "extra_info": f"👤 {author or '未知'} · ❤️ {likes} · 💬 {comments} · ⭐ {collects}",
+                        }
             except (json.JSONDecodeError, StopIteration, KeyError):
                 pass
 
         # 降级：从 meta 标签解析
-        return _parse_generic_html(html, note_url)
+        result = _parse_generic_html(html, note_url)
+        # 标记为降级结果，帮助前端判断
+        result["_fallback"] = True
+        return result
 
     except Exception as e:
         return {"error": f"请求小红书失败: {str(e)}"}

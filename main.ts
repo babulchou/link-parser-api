@@ -204,9 +204,9 @@ async function parseXiaohongshu(url: string): Promise<Record<string, unknown>> {
     });
     const html = await resp.text();
 
-    // Try __INITIAL_STATE__
+    // Try __INITIAL_STATE__ — 使用贪婪匹配确保完整 JSON
     const stateMatch = html.match(
-      /window\.__INITIAL_STATE__\s*=\s*({.*?})\s*<\/script>/s
+      /window\.__INITIAL_STATE__\s*=\s*({.+})\s*<\/script>/s
     );
     if (stateMatch) {
       try {
@@ -219,29 +219,37 @@ async function parseXiaohongshu(url: string): Promise<Record<string, unknown>> {
           if (detail) {
             const title = detail.title || "";
             const desc = detail.desc || "";
-            const nickname = detail.user?.nickname || "未知";
+            const nickname = detail.user?.nickname || "";
             const likes = detail.interactInfo?.likedCount || 0;
             const comments = detail.interactInfo?.commentCount || 0;
             const collects = detail.interactInfo?.collectedCount || 0;
             const tags = (detail.tagList || []).map((t: { name?: string }) => t.name || "");
             const noteType = detail.type === "video" ? "视频" : "图文";
-            let summaryText = desc || title;
-            if (summaryText.length > 300) summaryText = summaryText.substring(0, 300) + "...";
 
-            return {
-              title: title || "小红书笔记",
-              summary: summaryText,
-              author: nickname,
-              likes, comments, collects, tags,
-              content_type: noteType,
-              extra_info: `👤 ${nickname} · ❤️ ${likes} · 💬 ${comments} · ⭐ ${collects}`,
-            };
+            // 检查是否有实质内容 — 反爬空壳数据全为空
+            const hasRealContent = Boolean(title) || Boolean(desc) || Boolean(nickname);
+            if (hasRealContent) {
+              let summaryText = desc || title;
+              if (summaryText.length > 300) summaryText = summaryText.substring(0, 300) + "...";
+
+              return {
+                title: title || "小红书笔记",
+                summary: summaryText,
+                author: nickname || "未知",
+                likes, comments, collects, tags,
+                content_type: noteType,
+                extra_info: `👤 ${nickname || "未知"} · ❤️ ${likes} · 💬 ${comments} · ⭐ ${collects}`,
+              };
+            }
+            // 空壳数据 — fall through to generic parser
           }
         }
       } catch { /* fallthrough */ }
     }
 
-    return parseGenericHtml(html, noteUrl);
+    const fallbackResult = parseGenericHtml(html, noteUrl);
+    fallbackResult._fallback = true;
+    return fallbackResult;
   } catch (e) {
     return { error: `请求小红书失败: ${e}` };
   }
