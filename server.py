@@ -11,13 +11,14 @@ import json
 import logging
 import re
 import os
+import asyncio
 from urllib.parse import quote, urlparse, parse_qs
 
 import httpx
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 logger = logging.getLogger(__name__)
 
@@ -747,9 +748,9 @@ async def root():
 
 
 def _clean_url(url: str) -> str:
-    """清洗 URL：去除末尾中文标点、全角字符等非法字符"""
-    # 去除末尾的中文/全角标点
-    url = re.sub(r'[\uff00-\uffef\u3000-\u303f\u4e00-\u9fff，。！？、；：""''【】（）]+$', '', url)
+    """清洗 URL：去除末尾中文标点、全角符号等非法字符（不删除中文汉字）"""
+    # 只去除末尾的中文/全角标点符号（不包括 CJK 统一汉字 \u4e00-\u9fff）
+    url = re.sub(r'[\uff00-\uffef\u3000-\u303f，。！？、；：""''【】（）]+$', '', url)
     # 去除末尾的英文标点残留
     url = re.sub(r'[,;:!?)}\]]+$', '', url)
     return url.strip()
@@ -786,6 +787,480 @@ async def parse_link(url: str = Query(..., description="要解析的链接")):
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  灵感碰撞引擎 — IMA 知识库 + AI 深度思考
+# ═══════════════════════════════════════════════════════════════════
+
+# IMA API 配置（从环境变量读取）
+IMA_CLIENT_ID = os.environ.get("IMA_CLIENT_ID", "")
+IMA_API_KEY = os.environ.get("IMA_API_KEY", "")
+IMA_API_BASE = "https://ima.qq.com"
+
+# 智谱 GLM AI API（用于生成碰撞观点，GLM-4-Flash 免费）
+GLM_API_KEY = os.environ.get("GLM_API_KEY", "")
+GLM_API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+
+
+async def _ima_api(path: str, body: dict) -> dict | None:
+    """调用 IMA OpenAPI"""
+    if not IMA_CLIENT_ID or not IMA_API_KEY:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                f"{IMA_API_BASE}/{path}",
+                headers={
+                    "ima-openapi-clientid": IMA_CLIENT_ID,
+                    "ima-openapi-apikey": IMA_API_KEY,
+                    "Content-Type": "application/json",
+                },
+                json=body,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("retcode", 0) == 0:
+                    return data.get("data", data)
+                return data
+    except Exception as e:
+        logger.warning("IMA API 调用失败: %s — %s", path, e)
+    return None
+
+
+def _extract_keywords(text: str, max_keywords: int = 5) -> list[str]:
+    """从文本中提取搜索关键词（基于规则的轻量方案，无需额外依赖）"""
+    # 去除常见停用词和标点
+    stop_words = {
+        "的", "了", "是", "在", "我", "有", "和", "就", "不", "人", "都", "一", "一个",
+        "上", "也", "很", "到", "说", "要", "去", "你", "会", "着", "没有", "看", "好",
+        "自己", "这", "他", "她", "它", "们", "那", "这个", "那个", "什么", "怎么",
+        "可以", "能", "但是", "而且", "因为", "所以", "如果", "或者", "还是", "已经",
+        "其实", "可能", "应该", "觉得", "感觉", "这样", "那样", "比较", "非常",
+        "真的", "确实", "但", "而", "又", "也", "还", "才", "吧", "吗", "呢", "啊",
+        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+        "have", "has", "had", "do", "does", "did", "will", "would", "shall",
+        "should", "may", "might", "must", "can", "could", "about", "above",
+        "after", "before", "between", "but", "by", "for", "from", "in", "into",
+        "of", "on", "or", "out", "over", "so", "than", "that", "this", "to",
+        "under", "up", "with", "and", "not", "no", "it", "its", "i", "my", "me",
+        "we", "you", "your", "he", "she", "they", "them", "their", "what", "how",
+    }
+
+    # 提取英文词和中文短语
+    # 英文：提取完整单词（2字母以上）
+    en_words = re.findall(r'[a-zA-Z]{2,}', text)
+    en_keywords = [w.lower() for w in en_words if w.lower() not in stop_words and len(w) >= 3]
+
+    # 中文：简单的 n-gram 切分（2-4字），偏向名词/概念性短语
+    cn_text = re.sub(r'[a-zA-Z0-9\s\.,;:!?\-\'"()\[\]{}<>@#$%^&*+=|/\\~`，。！？、；：""''【】（）《》]', ' ', text)
+    cn_segments = cn_text.split()
+
+    cn_keywords = []
+    for seg in cn_segments:
+        seg = seg.strip()
+        if len(seg) < 2:
+            continue
+        if seg in stop_words:
+            continue
+        # 2-6字的中文短语作为关键词
+        if 2 <= len(seg) <= 6:
+            cn_keywords.append(seg)
+        elif len(seg) > 6:
+            # 长段切成 2-4 字的滑动窗口，取头尾
+            cn_keywords.append(seg[:4])
+            if len(seg) > 4:
+                cn_keywords.append(seg[-4:])
+
+    # 合并去重，优先英文专有名词和中文短语
+    seen = set()
+    keywords = []
+    for kw in en_keywords + cn_keywords:
+        if kw not in seen:
+            seen.add(kw)
+            keywords.append(kw)
+
+    return keywords[:max_keywords]
+
+
+def _compute_relevance_score(query_text: str, title: str, highlight: str) -> float:
+    """计算搜索结果与原始内容的相关性分数（0-1）"""
+    query_lower = query_text.lower()
+    title_lower = (title or "").lower()
+    highlight_lower = (highlight or "").lower()
+
+    # 提取 query 的关键词
+    query_keywords = _extract_keywords(query_text, max_keywords=8)
+    if not query_keywords:
+        return 0.3  # 无法提取关键词时给中等分
+
+    matched = 0
+    total = len(query_keywords)
+
+    for kw in query_keywords:
+        kw_l = kw.lower()
+        # 在标题中匹配权重更高
+        if kw_l in title_lower:
+            matched += 1.5
+        elif kw_l in highlight_lower:
+            matched += 1.0
+
+    score = min(matched / max(total, 1), 1.0)
+    return score
+
+
+async def _search_ima_knowledge_bases(query: str, limit: int = 5) -> list[dict]:
+    """搜索所有知识库中的相关内容（优化版：关键词提取 + 相关性过滤）"""
+    # 1. 获取用户的知识库列表
+    kb_list = await _ima_api("openapi/wiki/v1/search_knowledge_base", {
+        "query": "", "cursor": "", "limit": 20
+    })
+    if not kb_list or not kb_list.get("info_list"):
+        return []
+
+    # 2. 从内容中提取关键词，用关键词搜索（而不是原文前100字）
+    keywords = _extract_keywords(query, max_keywords=5)
+    search_query = " ".join(keywords) if keywords else query[:50]
+    logger.info("知识库搜索关键词: %s (原文: %s...)", search_query, query[:60])
+
+    # 3. 搜索更多知识库（前10个），但会在后续过滤不相关结果
+    all_kbs = kb_list["info_list"][:10]
+
+    async def search_one_kb(kb_id: str, kb_name: str) -> list[dict]:
+        """搜索单个知识库，返回结果列表（不再 append 共享变量）"""
+        kb_results = []
+        data = await _ima_api("openapi/wiki/v1/search_knowledge", {
+            "query": search_query, "knowledge_base_id": kb_id, "cursor": ""
+        })
+        if data and data.get("info_list"):
+            for item in data["info_list"][:3]:
+                title = item.get("title", "")
+                highlight = item.get("highlight_content", "")
+                # 计算相关性分数
+                score = _compute_relevance_score(query, title, highlight)
+                kb_results.append({
+                    "title": title,
+                    "highlight": highlight,
+                    "kb_name": kb_name,
+                    "media_id": item.get("media_id", ""),
+                    "_relevance_score": score,
+                })
+        return kb_results
+
+    tasks = [search_one_kb(kb["id"], kb.get("name", "")) for kb in all_kbs]
+    gather_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # 合并所有结果，跳过异常
+    results = []
+    for i, res in enumerate(gather_results):
+        if isinstance(res, Exception):
+            kb_name = all_kbs[i].get("name", "unknown") if i < len(all_kbs) else "unknown"
+            logger.warning("知识库 '%s' 搜索异常: %s", kb_name, res)
+        elif isinstance(res, list):
+            results.extend(res)
+
+    # 4. 按相关性排序，过滤掉明显不相关的结果（分数 < 0.15）
+    relevant = [r for r in results if r.get("_relevance_score", 0) >= 0.15]
+    relevant.sort(key=lambda x: x.get("_relevance_score", 0), reverse=True)
+
+    logger.info("知识库搜索结果: 总 %d 条, 过滤后 %d 条 (阈值>=0.15)",
+                len(results), len(relevant))
+    if results and not relevant:
+        # 如果全部被过滤，保留分数最高的1条（至少给 AI 一些参考）
+        results.sort(key=lambda x: x.get("_relevance_score", 0), reverse=True)
+        relevant = results[:1]
+
+    return relevant[:8]  # 最多返回8条
+
+
+async def _search_ima_notes(query: str) -> list[dict]:
+    """搜索 IMA 笔记中的相关内容"""
+    results = []
+    data = await _ima_api("openapi/note/v1/search_note_book", {
+        "search_type": 1,  # 正文搜索
+        "query_info": {"content": query},
+        "start": 0, "end": 5,
+    })
+    if data and data.get("docs"):
+        for doc in data["docs"][:5]:
+            basic = doc.get("doc", {}).get("basic_info", {})
+            results.append({
+                "title": basic.get("title", ""),
+                "summary": basic.get("summary", ""),
+                "docid": basic.get("docid", ""),
+                "folder_name": basic.get("folder_name", ""),
+            })
+    return results
+
+
+async def _generate_insight_with_ai(
+    new_content: str,
+    content_type: str,
+    knowledge_items: list[dict],
+    note_items: list[dict],
+    history_items: list[dict],
+) -> str:
+    """用 AI 生成真正有深度的灵感碰撞"""
+    if not GLM_API_KEY:
+        # 没有 AI API Key 时，用纯规则生成（但比简单匹配好）
+        return _generate_rule_based_insight(
+            new_content, knowledge_items, note_items, history_items
+        )
+
+    # 构建 context
+    context_parts = []
+
+    if knowledge_items:
+        kb_text = "\n".join([
+            f"- 【{k.get('kb_name', '知识库')}】{k.get('title', '')}：{k.get('highlight', '')[:200]}"
+            f"（相关度：{'高' if k.get('_relevance_score', 0) >= 0.5 else '中' if k.get('_relevance_score', 0) >= 0.25 else '低'}）"
+            for k in knowledge_items[:5]
+        ])
+        context_parts.append(f"## 知识库中的搜索结果（注意：低相关度的条目可能与用户想法无关，请自行判断）\n{kb_text}")
+
+    if note_items:
+        note_text = "\n".join([
+            f"- 【{n.get('folder_name', '笔记')}】{n.get('title', '')}：{n.get('summary', '')[:150]}"
+            for n in note_items[:3]
+        ])
+        context_parts.append(f"## 笔记中的相关内容\n{note_text}")
+
+    if history_items:
+        hist_text = "\n".join([
+            f"- [{h.get('type', '')}] {h.get('content', '')[:150]}"
+            for h in history_items[:5]
+        ])
+        context_parts.append(f"## 历史记录中的相关想法\n{hist_text}")
+
+    context = "\n\n".join(context_parts) if context_parts else "（没有找到直接相关的参考资料）"
+
+    prompt = f"""你是一个思维碰撞助手。用户刚刚记录了一条新想法，你需要基于参考资料进行深度思维碰撞，产生真正有价值的启发。
+
+## 用户刚记录的内容
+类型：{content_type}
+内容：{new_content}
+
+## 参考资料
+{context}
+
+## 核心原则
+
+### 关于参考资料的使用
+- **只用真正相关的参考资料**。如果某条参考资料和用户的想法没有实质关联（主题不同、领域无关），直接忽略它，不要勉强建立联系
+- 宁可基于用户的想法本身做深度延伸，也不要硬塞不相关的知识库内容
+- 如果参考资料中确实有高度相关的内容，自然地融入回应，说明启发来源
+
+### 关于碰撞质量
+1. **产生新观点** — 把不同来源的信息交叉组合，发现矛盾、互补、延伸的可能性
+2. **提出有力的反问** — "你有没有想过...?"、"如果把X和Y结合会怎样?"
+3. **指出有趣的张力** — "你的这个想法和XX存在一个有趣的矛盾..."
+4. **深度延伸** — 基于用户的想法往更深处推进一步，提供他可能没想到的视角
+5. **绝对不要**说"你之前写过类似的"这种无用信息
+
+### 关于语气
+- 像一个思维敏锐的朋友在跟你聊天
+- 不要用"以下是我的分析"、"总结来说"之类的套话
+- 可以犀利、可以温和，但一定要有观点
+- 如果用户的想法有盲区，大胆指出来
+
+直接输出灵感内容（100-200字），不要加标题、不要用markdown格式。"""
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                GLM_API_URL,
+                headers={
+                    "Authorization": f"Bearer {GLM_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "glm-4-flash",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.8,
+                    "max_tokens": 400,
+                    "stream": False,
+                },
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                choices = data.get("choices", [])
+                if choices:
+                    return choices[0].get("message", {}).get("content", "").strip()
+    except Exception as e:
+        logger.warning("AI 生成失败: %s", e)
+
+    # AI 调用失败，降级到规则生成
+    return _generate_rule_based_insight(
+        new_content, knowledge_items, note_items, history_items
+    )
+
+
+def _generate_rule_based_insight(
+    new_content: str,
+    knowledge_items: list[dict],
+    note_items: list[dict],
+    history_items: list[dict],
+) -> str:
+    """无 AI 时的规则灵感生成 — 比简单关键词匹配更有深度"""
+    parts = []
+
+    if knowledge_items:
+        kb = knowledge_items[0]
+        kb_title = kb.get("title", "")
+        kb_name = kb.get("kb_name", "知识库")
+        highlight = kb.get("highlight", "")[:100]
+        if highlight:
+            parts.append(
+                f"你的「{kb_name}」里有一篇《{kb_title}》提到了类似的话题"
+                f"——\"{highlight}\"。把你刚才写的和这个放在一起看，有没有发现新的角度？"
+            )
+        elif kb_title:
+            parts.append(
+                f"你在「{kb_name}」里收藏过《{kb_title}》，和你刚记录的这条可能存在有趣的交集。"
+                f"不妨回头看看那篇内容，也许能碰撞出新的想法。"
+            )
+
+    if note_items and not parts:
+        note = note_items[0]
+        note_title = note.get("title", "")
+        folder = note.get("folder_name", "笔记")
+        summary = note.get("summary", "")[:80]
+        if summary:
+            parts.append(
+                f"你在「{folder}」笔记本里有一篇《{note_title}》写道：\"{summary}\"。"
+                f"对比你刚才的想法，这两条思考之间可能存在值得深挖的联系。"
+            )
+
+    if history_items:
+        h = history_items[0]
+        h_content = h.get("content", "")[:80]
+        h_type = h.get("type", "")
+        type_map = {"thought": "想法", "inspiration": "灵感", "reflection": "感悟",
+                    "product": "产品思考", "quote": "摘录", "todo": "待办"}
+        h_label = type_map.get(h_type, "记录")
+        if h_content:
+            if parts:
+                parts.append(
+                    f"加上你之前的一条{h_label}「{h_content}」——三者之间是否在描述同一个底层模式？"
+                )
+            else:
+                parts.append(
+                    f"你之前有条{h_label}写过「{h_content}」，和这次的想法在主题上有呼应。"
+                    f"如果把这两个时间点的思考连起来看，你的认知可能已经在某个方向上进化了。"
+                )
+
+    if not parts:
+        # 完全没有相关内容 — 给一个有思考性的鼓励
+        if len(new_content) > 80:
+            return "这条记录内容丰富，是一次深度思考。它暂时还是个独立的思考节点——随着你继续记录，它会自然地与未来的想法产生连接。"
+        else:
+            return "新的思考种子已经种下。现在它看起来独立，但好想法往往在积累到一定量后突然产生化学反应。"
+
+    return " ".join(parts)
+
+
+@app.post("/inspire")
+async def inspire(body: dict = Body(...)):
+    """
+    灵感碰撞引擎：接收新记录内容，搜索 IMA 知识库和笔记，
+    结合历史记录生成有深度的灵感启迪。
+
+    Request body:
+    {
+        "content": "用户刚记录的内容",
+        "type": "thought",
+        "history": [{"content": "...", "type": "..."}, ...]  // 最近几条历史记录
+    }
+    """
+    content = str(body.get("content", "")).strip()
+    content_type = str(body.get("type", "thought")).strip()
+    history = body.get("history", [])
+
+    if not content:
+        return JSONResponse(status_code=400, content={"error": "content 不能为空"})
+
+    # 输入验证：content 长度限制（防止超长内容打爆 AI 上下文）
+    MAX_CONTENT_LENGTH = 5000
+    if len(content) > MAX_CONTENT_LENGTH:
+        content = content[:MAX_CONTENT_LENGTH]
+        logger.info("content 超长截断: %d -> %d", len(body.get("content", "")), MAX_CONTENT_LENGTH)
+
+    # 输入验证：content_type 白名单校验（防止恶意值拼入 AI prompt）
+    ALLOWED_TYPES = {"thought", "inspiration", "todo", "quote", "link", "reflection", "product"}
+    if content_type not in ALLOWED_TYPES:
+        content_type = "thought"
+
+    # 输入验证：history 格式校验和限制
+    if not isinstance(history, list):
+        history = []
+    validated_history = []
+    for h in history[:8]:  # 最多8条历史
+        if isinstance(h, dict):
+            h_content = str(h.get("content", ""))[:200]  # 每条最多200字
+            h_type = h.get("type", "thought")
+            if h_type not in ALLOWED_TYPES:
+                h_type = "thought"
+            validated_history.append({"content": h_content, "type": h_type})
+    history = validated_history
+
+    type_labels = {
+        "thought": "想法", "inspiration": "灵感", "todo": "待办",
+        "quote": "摘录", "link": "链接", "reflection": "感悟", "product": "产品思考"
+    }
+    type_label = type_labels.get(content_type, content_type)
+
+    # 提取搜索关键词（从内容中提取核心概念，而不是直接用原文）
+    keywords = _extract_keywords(content, max_keywords=5)
+    search_query = " ".join(keywords) if keywords else content[:50]
+    logger.info("灵感碰撞搜索关键词: %s", search_query)
+
+    # 并行搜索 IMA 知识库 + IMA 笔记
+    kb_results, note_results = [], []
+
+    if IMA_CLIENT_ID and IMA_API_KEY:
+        kb_task = _search_ima_knowledge_bases(search_query)
+        note_task = _search_ima_notes(search_query)
+        kb_results, note_results = await asyncio.gather(
+            kb_task, note_task, return_exceptions=True
+        )
+        if isinstance(kb_results, Exception):
+            logger.warning("知识库搜索异常: %s", kb_results)
+            kb_results = []
+        if isinstance(note_results, Exception):
+            logger.warning("笔记搜索异常: %s", note_results)
+            note_results = []
+
+    # 生成灵感碰撞
+    insight_text = await _generate_insight_with_ai(
+        new_content=content,
+        content_type=type_label,
+        knowledge_items=kb_results,
+        note_items=note_results,
+        history_items=history[:5],
+    )
+
+    # 构建关联来源
+    sources = []
+    for k in (kb_results or [])[:3]:
+        sources.append({
+            "type": "knowledge",
+            "title": k.get("title", ""),
+            "from": k.get("kb_name", "知识库"),
+        })
+    for n in (note_results or [])[:2]:
+        sources.append({
+            "type": "note",
+            "title": n.get("title", ""),
+            "from": n.get("folder_name", "笔记"),
+        })
+
+    return JSONResponse(content={
+        "insight": insight_text,
+        "sources": sources,
+        "has_knowledge": len(kb_results or []) > 0,
+        "has_notes": len(note_results or []) > 0,
+        "has_ai": bool(GLM_API_KEY),
+    })
 
 
 # ═══════════════════════════════════════════════════════════════════
