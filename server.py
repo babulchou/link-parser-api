@@ -9,6 +9,7 @@
 
 import json
 import logging
+import random
 import re
 import os
 import asyncio
@@ -1209,6 +1210,42 @@ async def inspire(body: dict = Body(...)):
     }
     type_label = type_labels.get(content_type, content_type)
 
+    # ===== 待办类型：轻量处理，不走知识库/AI 全流程 =====
+    if content_type == "todo":
+        # 只从历史记录中找关键词相关的待办
+        keywords = _extract_keywords(content, max_keywords=3)
+        related_todos = []
+        for h in history:
+            if h.get("type") == "todo":
+                h_content = h.get("content", "")
+                h_keywords = _extract_keywords(h_content, max_keywords=3)
+                overlap = set(keywords) & set(h_keywords)
+                if overlap:
+                    related_todos.append({
+                        "content": h_content[:100],
+                        "overlap": list(overlap),
+                    })
+        
+        tips = [
+            "已加入待办清单，记下来就是执行力的第一步。",
+            "待办已记录，保持节奏逐个击破。",
+            "清单又多了一项，完成后别忘了打勾。",
+            "好的执行力从清晰的清单开始。",
+        ]
+        tip = random.choice(tips)
+        
+        if related_todos:
+            related_items = [r["content"] for r in related_todos[:2]]
+            tip += f" 你之前有相关的待办：{'、'.join(related_items)}"
+        
+        return JSONResponse(content={
+            "insight": tip,
+            "sources": [],
+            "has_knowledge": False,
+            "has_notes": False,
+            "has_ai": False,
+        })
+
     # 提取搜索关键词（从内容中提取核心概念，而不是直接用原文）
     keywords = _extract_keywords(content, max_keywords=5)
     search_query = " ".join(keywords) if keywords else content[:50]
@@ -1260,6 +1297,205 @@ async def inspire(body: dict = Body(...)):
         "has_knowledge": len(kb_results or []) > 0,
         "has_notes": len(note_results or []) > 0,
         "has_ai": bool(GLM_API_KEY),
+    })
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  回顾提问引擎 — AI 总结回答 + 引用定位
+# ═══════════════════════════════════════════════════════════════════
+
+@app.post("/ask")
+async def ask_entries(body: dict = Body(...)):
+    """
+    回顾页提问接口：根据用户问题，从过往记录中 AI 总结回答。
+    返回引用的条目 ID，前端可点击跳转。
+
+    Request body:
+    {
+        "question": "用户的提问",
+        "entries": [
+            {"id": "xxx", "content": "...", "type": "thought", "tags": [...], "created_at": "..."},
+            ...
+        ]  // 前端传入的所有记录（最多 200 条）
+    }
+    """
+    question = str(body.get("question", "")).strip()
+    entries = body.get("entries", [])
+
+    if not question:
+        return JSONResponse(status_code=400, content={"error": "question 不能为空"})
+
+    if not isinstance(entries, list) or len(entries) == 0:
+        return JSONResponse(status_code=400, content={"error": "entries 不能为空"})
+
+    # 输入验证
+    question = question[:500]  # 问题最多 500 字
+    validated_entries = []
+    for e in entries[:200]:  # 最多 200 条
+        if isinstance(e, dict) and e.get("content"):
+            validated_entries.append({
+                "id": str(e.get("id", "")),
+                "content": str(e.get("content", ""))[:500],  # 每条最多 500 字
+                "type": str(e.get("type", "thought")),
+                "tags": e.get("tags", []) if isinstance(e.get("tags"), list) else [],
+                "created_at": str(e.get("created_at", "")),
+            })
+
+    if not validated_entries:
+        return JSONResponse(status_code=400, content={"error": "没有有效的记录"})
+
+    # Step 1: 前端关键词预筛选（后端再做一次确保质量）
+    question_keywords = _extract_keywords(question, max_keywords=8)
+
+    # Step 2: 对每条记录计算相关性分数
+    scored_entries = []
+    for entry in validated_entries:
+        content_lower = entry["content"].lower()
+        question_lower = question.lower()
+        score = 0
+        matched_words = []
+
+        # 直接子串匹配
+        for kw in question_keywords:
+            if kw.lower() in content_lower:
+                score += 5
+                matched_words.append(kw)
+
+        # 标签匹配
+        tags_lower = [t.lower() for t in entry.get("tags", [])]
+        for kw in question_keywords:
+            if any(kw.lower() in t for t in tags_lower):
+                score += 4
+
+        # 问题中提到的类型
+        type_labels_map = {
+            "thought": "想法", "inspiration": "灵感", "todo": "待办",
+            "quote": "摘录", "link": "链接", "reflection": "感悟", "product": "产品"
+        }
+        tl = type_labels_map.get(entry["type"], "")
+        if tl and tl in question_lower:
+            score += 3
+
+        if score > 0:
+            scored_entries.append({**entry, "_score": score, "_matched": matched_words})
+
+    scored_entries.sort(key=lambda x: x["_score"], reverse=True)
+
+    # Step 3: 构建 AI prompt
+    if not GLM_API_KEY:
+        # 无 AI 时返回纯搜索结果（让前端走本地逻辑）
+        return JSONResponse(content={
+            "answer": "",
+            "references": [],
+            "has_ai": False,
+            "total_relevant": len(scored_entries),
+        })
+
+    # 选取 top 相关记录给 AI（最多 15 条）
+    top_entries = scored_entries[:15] if scored_entries else validated_entries[:15]
+    is_broad = len(scored_entries) == 0  # 宽泛问题，没有关键词匹配
+
+    # 构建条目上下文
+    entries_context = "\n".join([
+        f"[记录{i+1}] ID:{e['id']} | 类型:{type_labels_map.get(e['type'], e['type'])} | "
+        f"时间:{e.get('created_at', '未知')[:16]} | "
+        f"标签:{','.join(e.get('tags', [])[:5]) or '无'}\n"
+        f"内容：{e['content']}"
+        for i, e in enumerate(top_entries)
+    ])
+
+    prompt = f"""你是"随手记"应用的 AI 助手。用户在"回顾"页面提出了一个问题，你需要根据他过往的记录内容给出总结性回复。
+
+## 用户的提问
+{question}
+
+## 用户的过往记录（共 {len(validated_entries)} 条，以下是最相关的 {len(top_entries)} 条）
+{entries_context}
+
+## 回答要求
+
+1. **基于记录回答**：你的回答必须基于用户的真实记录内容，不要编造用户没有记录过的信息
+2. **引用定位**：在回答中提到某条具体记录时，用 [[记录N]] 的格式标注（N 是上面的编号），这样用户可以点击跳转查看原文
+3. **总结归纳**：
+   - 如果是搜索类问题（找某条记录）：直接指出是哪条，简要说明内容
+   - 如果是总结类问题（分析趋势、归纳主题）：从记录中提炼规律、主题、趋势
+   - 如果是开放性问题：结合记录给出有价值的洞察和思考
+4. **语气**：像一个了解用户思考脉络的智能助手，自然、简洁、有洞察力
+5. **长度**：150-300 字，不要过长
+
+直接输出回答，不要加标题或前缀。"""
+
+    # Step 4: 调用 AI
+    ai_answer = ""
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                GLM_API_URL,
+                headers={
+                    "Authorization": f"Bearer {GLM_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "glm-4-flash",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.7,
+                    "max_tokens": 600,
+                    "stream": False,
+                },
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                choices = data.get("choices", [])
+                if choices:
+                    ai_answer = choices[0].get("message", {}).get("content", "").strip()
+    except Exception as e:
+        logger.warning("Ask AI 生成失败: %s", e)
+
+    if not ai_answer:
+        return JSONResponse(content={
+            "answer": "",
+            "references": [],
+            "has_ai": False,
+            "total_relevant": len(scored_entries),
+        })
+
+    # Step 5: 解析 AI 回答中的引用标记 [[记录N]]，转换为条目 ID
+    references = []
+    ref_pattern = re.findall(r'\[\[记录(\d+)\]\]', ai_answer)
+    seen_ids = set()
+    for ref_num_str in ref_pattern:
+        try:
+            idx = int(ref_num_str) - 1  # 转为 0-based
+            if 0 <= idx < len(top_entries):
+                entry_id = top_entries[idx]["id"]
+                if entry_id and entry_id not in seen_ids:
+                    seen_ids.add(entry_id)
+                    references.append({
+                        "id": entry_id,
+                        "content": top_entries[idx]["content"][:80],
+                        "type": top_entries[idx]["type"],
+                        "ref_num": int(ref_num_str),
+                    })
+        except (ValueError, IndexError):
+            pass
+
+    # 清理 AI 回答中的引用标记，替换为前端可解析的格式
+    # [[记录N]] → <ref data-id="xxx">记录N</ref>
+    def replace_ref(match):
+        num = int(match.group(1))
+        idx = num - 1
+        if 0 <= idx < len(top_entries) and top_entries[idx]["id"]:
+            entry_id = top_entries[idx]["id"]
+            return f'<ref data-id="{entry_id}">📌 记录{num}</ref>'
+        return match.group(0)
+
+    formatted_answer = re.sub(r'\[\[记录(\d+)\]\]', replace_ref, ai_answer)
+
+    return JSONResponse(content={
+        "answer": formatted_answer,
+        "references": references,
+        "has_ai": True,
+        "total_relevant": len(scored_entries),
     })
 
 
