@@ -1500,6 +1500,259 @@ async def ask_entries(body: dict = Body(...)):
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  IMA 笔记同步引擎 — 按分类归档到 IMA 笔记本
+# ═══════════════════════════════════════════════════════════════════
+
+# 分类 → IMA 笔记本文件夹映射（脑瓜子分类 → IMA 文件夹名）
+CATEGORY_FOLDER_MAP = {
+    "thought": "💭 想法",
+    "inspiration": "⚡ 灵感",
+    "todo": "✅ 待办",
+    "quote": "📖 摘录",
+    "link": "🔗 链接",
+    "reflection": "🪞 感悟",
+    "product": "🧪 产品思考",
+}
+
+# 缓存 IMA 笔记本文件夹 ID（启动后首次使用时加载）
+_ima_folder_cache: dict[str, str] = {}  # folder_name -> folder_id
+_ima_folder_cache_loaded = False
+
+
+async def _ensure_ima_folder_cache() -> dict[str, str]:
+    """加载 IMA 笔记本文件夹列表到缓存"""
+    global _ima_folder_cache, _ima_folder_cache_loaded
+    if _ima_folder_cache_loaded:
+        return _ima_folder_cache
+
+    data = await _ima_api("openapi/note/v1/list_note_folder_by_cursor", {
+        "cursor": "0", "limit": 50
+    })
+    if data and data.get("note_book_folders"):
+        for folder_item in data["note_book_folders"]:
+            folder = folder_item.get("folder", {})
+            basic = folder.get("basic_info", {})
+            name = basic.get("name", "")
+            fid = basic.get("folder_id", "")
+            if name and fid:
+                _ima_folder_cache[name] = fid
+        logger.info("IMA 笔记本文件夹缓存已加载: %d 个", len(_ima_folder_cache))
+    _ima_folder_cache_loaded = True
+    return _ima_folder_cache
+
+
+async def _get_or_search_folder_id(folder_name: str) -> str | None:
+    """获取指定名称的 IMA 笔记本文件夹 ID，缓存优先"""
+    cache = await _ensure_ima_folder_cache()
+    if folder_name in cache:
+        return cache[folder_name]
+    # 缓存没有，说明还没有这个文件夹 → IMA 不支持创建文件夹 API，只能放到默认位置
+    return None
+
+
+async def _sync_entry_to_ima(
+    content: str,
+    entry_type: str,
+    tags: list[str] | None = None,
+    entry_id: str = "",
+    created_at: str = "",
+) -> dict:
+    """将一条记录同步到 IMA 笔记本（按分类归档）"""
+    if not IMA_CLIENT_ID or not IMA_API_KEY:
+        return {"ok": False, "error": "IMA API 未配置"}
+
+    # 1. 确定目标文件夹
+    folder_name = CATEGORY_FOLDER_MAP.get(entry_type, "💭 想法")
+    folder_id = await _get_or_search_folder_id(folder_name)
+
+    # 2. 构建笔记内容（Markdown 格式）
+    type_labels = {
+        "thought": "想法", "inspiration": "灵感", "todo": "待办",
+        "quote": "摘录", "link": "链接", "reflection": "感悟", "product": "产品思考"
+    }
+    type_label = type_labels.get(entry_type, entry_type)
+
+    # 标题：取内容前 30 字
+    title_text = content[:30].replace("\n", " ").strip()
+    if len(content) > 30:
+        title_text += "..."
+
+    tag_str = ""
+    if tags:
+        tag_str = f"\n\n**标签**: {' '.join(f'`{t}`' for t in tags)}"
+
+    time_str = ""
+    if created_at:
+        time_str = f"\n\n**记录时间**: {created_at[:16]}"
+
+    md_content = f"# {title_text}\n\n**分类**: {type_label}{tag_str}{time_str}\n\n---\n\n{content}"
+
+    # 确保 UTF-8 编码（IMA API 要求）
+    try:
+        md_content.encode("utf-8")
+    except UnicodeEncodeError:
+        md_content = md_content.encode("utf-8", errors="replace").decode("utf-8")
+
+    # 3. 调用 IMA import_doc API
+    body = {
+        "content_format": 1,  # Markdown
+        "content": md_content,
+    }
+    if folder_id:
+        body["folder_id"] = folder_id
+
+    result = await _ima_api("openapi/note/v1/import_doc", body)
+
+    if result:
+        doc_id = result.get("doc_id", "")
+        logger.info(
+            "IMA 同步成功: type=%s, folder=%s(%s), doc_id=%s",
+            entry_type, folder_name, folder_id or "默认", doc_id
+        )
+        return {"ok": True, "doc_id": doc_id, "folder": folder_name}
+    else:
+        logger.warning("IMA 同步失败: type=%s, content=%s...", entry_type, content[:50])
+        return {"ok": False, "error": "IMA API 调用失败"}
+
+
+@app.post("/sync-to-ima")
+async def sync_to_ima(body: dict = Body(...)):
+    """
+    将脑瓜子记录同步到 IMA 笔记本，按分类归档。
+
+    Request body:
+    {
+        "content": "记录内容",
+        "type": "thought",
+        "tags": ["标签1", "标签2"],
+        "entry_id": "supabase-uuid",
+        "created_at": "2026-03-27T12:00:00"
+    }
+    """
+    content = str(body.get("content", "")).strip()
+    entry_type = str(body.get("type", "thought")).strip()
+    tags = body.get("tags", [])
+    entry_id = str(body.get("entry_id", ""))
+    created_at = str(body.get("created_at", ""))
+
+    if not content:
+        return JSONResponse(status_code=400, content={"error": "content 不能为空"})
+
+    # 类型白名单
+    ALLOWED = {"thought", "inspiration", "todo", "quote", "link", "reflection", "product"}
+    if entry_type not in ALLOWED:
+        entry_type = "thought"
+
+    # 内容长度限制（IMA 单次 import 有大小上限）
+    if len(content) > 10000:
+        content = content[:10000]
+
+    result = await _sync_entry_to_ima(
+        content=content,
+        entry_type=entry_type,
+        tags=tags if isinstance(tags, list) else [],
+        entry_id=entry_id,
+        created_at=created_at,
+    )
+
+    status_code = 200 if result.get("ok") else 500
+    return JSONResponse(status_code=status_code, content=result)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  IMA 内容搜索接口 — 在脑瓜子里搜索 IMA 知识库 + 笔记
+# ═══════════════════════════════════════════════════════════════════
+
+@app.post("/search-ima")
+async def search_ima(body: dict = Body(...)):
+    """
+    搜索 IMA 知识库和笔记内容。
+
+    Request body:
+    {
+        "query": "搜索关键词",
+        "search_kb": true,     // 是否搜索知识库（默认 true）
+        "search_notes": true,  // 是否搜索笔记（默认 true）
+        "limit": 10            // 最大返回条数
+    }
+    """
+    query = str(body.get("query", "")).strip()
+    search_kb = body.get("search_kb", True)
+    search_notes = body.get("search_notes", True)
+    limit = min(int(body.get("limit", 10)), 20)
+
+    if not query:
+        return JSONResponse(status_code=400, content={"error": "query 不能为空"})
+
+    if not IMA_CLIENT_ID or not IMA_API_KEY:
+        return JSONResponse(content={
+            "results": [], "has_kb": False, "has_notes": False,
+            "error": "IMA API 未配置"
+        })
+
+    # 提取关键词优化搜索
+    keywords = _extract_keywords(query, max_keywords=5)
+    search_query = " ".join(keywords) if keywords else query[:50]
+
+    tasks = []
+    task_labels = []
+
+    if search_kb:
+        tasks.append(_search_ima_knowledge_bases(search_query, limit=limit))
+        task_labels.append("kb")
+    if search_notes:
+        tasks.append(_search_ima_notes(search_query))
+        task_labels.append("notes")
+
+    if not tasks:
+        return JSONResponse(content={"results": [], "has_kb": False, "has_notes": False})
+
+    gather_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    results = []
+    has_kb = False
+    has_notes = False
+
+    for i, res in enumerate(gather_results):
+        if isinstance(res, Exception):
+            logger.warning("IMA 搜索异常 (%s): %s", task_labels[i], res)
+            continue
+
+        label = task_labels[i]
+        if label == "kb" and isinstance(res, list):
+            has_kb = len(res) > 0
+            for item in res[:limit]:
+                results.append({
+                    "source": "knowledge",
+                    "title": item.get("title", ""),
+                    "highlight": item.get("highlight", ""),
+                    "from": item.get("kb_name", "知识库"),
+                    "relevance": item.get("_relevance_score", 0),
+                })
+        elif label == "notes" and isinstance(res, list):
+            has_notes = len(res) > 0
+            for item in res[:limit]:
+                results.append({
+                    "source": "note",
+                    "title": item.get("title", ""),
+                    "highlight": item.get("summary", ""),
+                    "from": item.get("folder_name", "笔记"),
+                    "relevance": 0.5,  # 笔记搜索没有评分
+                })
+
+    # 按相关性排序
+    results.sort(key=lambda x: x.get("relevance", 0), reverse=True)
+
+    return JSONResponse(content={
+        "results": results[:limit],
+        "has_kb": has_kb,
+        "has_notes": has_notes,
+        "query": search_query,
+        "total": len(results),
+    })
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  启动
 # ═══════════════════════════════════════════════════════════════════
 
